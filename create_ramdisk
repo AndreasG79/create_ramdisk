@@ -1,0 +1,144 @@
+#!/bin/bash
+
+# Ensure the script runs as root
+if [ "$EUID" -ne 0 ]; then
+    echo "Please run as root."
+    exit 1
+fi
+
+LOG_FILE="/var/log/ramdisk_setup.log"
+CONFIG_FILE="/etc/ramdisk_config.conf"
+
+# Function to log messages
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
+}
+
+# Function to check if ramdisk is mounted
+check_ramdisk() {
+    mountpoint -q "$MOUNT_POINT"
+    return $?  # 0 if mounted, 1 if not
+}
+
+# Get total system RAM in MB
+TOTAL_RAM_MB=$(grep MemTotal /proc/meminfo | awk '{print $2 / 1024}')
+TOTAL_RAM_MB=${TOTAL_RAM_MB%.*}
+MAX_RAM_MB=$((TOTAL_RAM_MB / 2))
+
+echo "Your system has approximately $TOTAL_RAM_MB MB of RAM."
+echo "You can allocate up to $MAX_RAM_MB MB for the RAM disk."
+
+# Default mount point
+DEFAULT_MOUNT_POINT="/mnt/ramdisk"
+
+# Ask user for mount point (default or custom)
+read -p "Enter mount point for RAM disk [default: $DEFAULT_MOUNT_POINT]: " user_mount_point
+if [ -z "$user_mount_point" ]; then
+    MOUNT_POINT="$DEFAULT_MOUNT_POINT"
+else
+    MOUNT_POINT="$user_mount_point"
+fi
+
+# Create mount point if it doesn't exist
+if [ ! -d "$MOUNT_POINT" ]; then
+    mkdir -p "$MOUNT_POINT"
+    log "Created mount point directory at $MOUNT_POINT."
+fi
+
+# Check if RAM disk is already mounted
+if check_ramdisk; then
+    read -p "RAM disk already mounted at $MOUNT_POINT. Do you want to (R)emount, (U)nmount, or (S)kip? [R/U/S]: " action
+    case "$action" in
+        R|r)
+            echo "Remounting RAM disk..."
+            log "User chose to remount RAM disk."
+            umount "$MOUNT_POINT"
+            ;;
+        U|u)
+            echo "Unmounting RAM disk..."
+            log "User chose to unmount RAM disk."
+            umount "$MOUNT_POINT"
+            # Remove from /etc/fstab
+            escaped_mount_point=$(printf '%s\n' "$MOUNT_POINT" | sed 's/[\/&]/\\&/g')
+            sed -i "\|^.*$escaped_mount_point.*$|d" /etc/fstab
+            echo "RAM disk unmounted and removed from /etc/fstab."
+            log "RAM disk unmounted and removed from /etc/fstab."
+            exit 0
+            ;;
+        S|s)
+            echo "Skipping..."
+            log "User chose to skip RAM disk setup."
+            exit 0
+            ;;
+        *)
+            echo "Invalid option, proceeding with setup..."
+            log "Invalid choice, proceeding with setup."
+            ;;
+    esac
+fi
+
+# Prompt for RAM disk size with validation
+while true; do
+    read -p "Enter the size of the RAM disk (e.g., 2G, 500M): " RAMDISK_SIZE
+    if echo "$RAMDISK_SIZE" | grep -qE '^[0-9]+([MG])$'; then
+        NUMBER=$(echo "$RAMDISK_SIZE" | grep -oE '^[0-9]+')
+        UNIT=$(echo "$RAMDISK_SIZE" | grep -oE '[MG]$')
+        if [[ "$UNIT" =~ [Gg] ]]; then
+            SIZE_MB=$((NUMBER * 1024))
+        elif [[ "$UNIT" =~ [Mm] ]]; then
+            SIZE_MB=$NUMBER
+        else
+            echo "Invalid unit. Please specify 'G' or 'M'."
+            continue
+        fi
+        if [ "$SIZE_MB" -le "$MAX_RAM_MB" ]; then
+            break
+        else
+            echo "Size exceeds 50% of total RAM. Max allowed: $MAX_RAM_MB MB."
+        fi
+    else
+        echo "Invalid format. Please enter size like '2G' or '500M'."
+    fi
+done
+
+# Mount the RAM disk
+mount -t tmpfs -o size=$RAMDISK_SIZE tmpfs "$MOUNT_POINT"
+if [ $? -eq 0 ]; then
+    echo "RAM disk of size $RAMDISK_SIZE mounted at $MOUNT_POINT."
+    log "Mounted RAM disk of size $RAMDISK_SIZE at $MOUNT_POINT."
+else
+    echo "Failed to mount RAM disk."
+    log "Failed to mount RAM disk."
+    exit 1
+fi
+
+# Add to /etc/fstab if not already present
+if ! grep -q "$MOUNT_POINT" /etc/fstab; then
+    echo "Adding to /etc/fstab..."
+    echo "tmpfs   $MOUNT_POINT   tmpfs   defaults,size=$RAMDISK_SIZE   0   0" | tee -a /etc/fstab
+    log "Added RAM disk to /etc/fstab."
+else
+    echo "Entry already exists in /etc/fstab."
+    log "Entry for RAM disk already exists in /etc/fstab."
+fi
+
+# Save configuration
+cat > "$CONFIG_FILE" <<EOF
+# RAM disk configuration
+MOUNT_POINT=$MOUNT_POINT
+RAMDISK_SIZE=$RAMDISK_SIZE
+EOF
+echo "Configuration saved to $CONFIG_FILE."
+log "Saved RAM disk configuration to $CONFIG_FILE."
+
+# Display current status
+if check_ramdisk; then
+    echo "RAM disk is mounted at $MOUNT_POINT."
+else
+    echo "RAM disk is not mounted at $MOUNT_POINT."
+fi
+log "Completed RAM disk setup at $MOUNT_POINT."
+
+echo "To automatically remount the RAM disk after restart, include the following command in your startup scripts or create a systemd service:"
+echo "  sudo mount -t tmpfs -o size=$RAMDISK_SIZE tmpfs $MOUNT_POINT"
+echo "Or, to automate during boot, you can add a script that reads $CONFIG_FILE and mounts accordingly."
